@@ -1,4 +1,0 @@
-[submodule "collect_data/piper_sdk_demo"]
-	path = collect_data/piper_sdk_demo
-	url = https://github.com/agilexrobotics/piper_sdk_demo.git
-	branch = master
