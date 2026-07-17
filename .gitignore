@@ -1,8 +1,9 @@
 __pycache__/
 *.py[cod]
+.pytest_cache/
 .bridge_deps/
-core
-core.*
+/core
+/core.*
 
 # ROS / CMake generated workspaces
 **/build/

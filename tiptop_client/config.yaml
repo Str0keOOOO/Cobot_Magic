@@ -1,0 +1,62 @@
+# This file is for the Cobot Magic upper computer only.  It runs ROS and
+# hardware-local control loops; the GPU server only connects through SSH -R.
+
+controller:
+  # Replace with the upper computer's IP reachable from the laptop before use.
+  # Keeping loopback is safe for local development, but cannot accept the laptop tunnel.
+  bind_host: "10.17.115.93"
+  port: 5555
+  protocol_version: "1.0"
+  max_message_bytes: 67108864
+
+robot:
+  state_topic: "/puppet/joint_right"
+  command_topic: "/master/joint_right"
+  arm_dof: 6
+  ros_joint_count: 7
+  # Piper_ros_private-ros-noetic/src/piper/scripts/piper_start_ms_node.py
+  # publishes the local state loop at rospy.Rate(200).
+  servo_rate_hz: 200.0
+  state_timeout_s: 5.0
+  max_state_age_s: 0.25
+  max_initial_error_rad: 0.017453292519943295
+  # Existing Piper driver clamps its gripper command to [0.0, 0.08] metres.
+  gripper_open_position: 0.08
+  gripper_closed_position: 0.0
+  gripper_min_move_time_s: 0.25
+  gripper_max_move_time_s: 1.5
+  # Piper SDK manufacturer defaults in the existing joint0..joint5 order.
+  # Verify these against the live controller before autonomous operation.
+  joint_lower_rad: [-2.6179, 0.0, -2.967, -1.745, -1.22, -2.09439]
+  joint_upper_rad: [2.6179, 3.14, 0.0, 1.745, 1.22, 2.09439]
+  max_joint_velocity_rad_s: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+  # Must agree with the TiPToP server client.  "intervals" means each duration
+  # ends at its matching waypoint, including the final waypoint.
+  trajectory_duration_mode: "intervals"
+
+camera_server:
+  # Same upper-computer address currently used by the controller service.
+  bind_host: "10.17.115.93"
+  port: 5556
+  max_message_bytes: 134217728
+  max_snapshot_age_s: 0.25
+  sync_queue_size: 10
+  sync_slop_s: 0.05
+
+# TiPToP reads only the selected right-wrist D435; it does not modify or start
+# a camera driver. multi_camera.launch maps serial 339222070351 to /camera_r
+# and enables its RGB-aligned depth stream. The bundled RealSense ROS driver
+# publishes 16UC1 depth values in millimetres (ROS_DEPTH_SCALE = 0.001 m).
+cameras:
+  right_wrist:
+    namespace: "/camera_r"
+    serial: "339222070351"
+    role: "right_wrist"
+    color_topic: "/camera_r/color/image_raw"
+    aligned_depth_topic: "/camera_r/aligned_depth_to_color/image_raw"
+    color_info_topic: "/camera_r/color/camera_info"
+    left_ir_topic: null
+    right_ir_topic: null
+    ir_info_topic: null
+    depth_scale: 0.001
+    depth_source: "onboard_aligned"

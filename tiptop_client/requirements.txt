@@ -1,0 +1,5 @@
+numpy>=1.20,<2
+pyzmq>=25
+msgpack>=1.0,<1.1
+msgpack-numpy>=0.4.8
+PyYAML>=5.4
