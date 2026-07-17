@@ -218,7 +218,6 @@ class RosOperator:
             while self.robot_base_deque[0].header.stamp.to_sec() < frame_time:
                 self.robot_base_deque.popleft()
             robot_base = self.robot_base_deque.popleft()
-
         return (img_front, img_left, img_right, img_front_depth, img_left_depth, img_right_depth,
                 puppet_arm_left, puppet_arm_right, master_arm_left, master_arm_right, robot_base)
 
@@ -409,9 +408,9 @@ def get_arguments():
     
     # topic name of arm
     parser.add_argument('--master_arm_left_topic', action='store', type=str, help='master_arm_left_topic',
-                        default='/master/joint_left', required=False)
+                        default='/puppet/joint_left', required=False)
     parser.add_argument('--master_arm_right_topic', action='store', type=str, help='master_arm_right_topic',
-                        default='/master/joint_right', required=False)
+                        default='/puppet/joint_right', required=False)
     parser.add_argument('--puppet_arm_left_topic', action='store', type=str, help='puppet_arm_left_topic',
                         default='/puppet/joint_left', required=False)
     parser.add_argument('--puppet_arm_right_topic', action='store', type=str, help='puppet_arm_right_topic',

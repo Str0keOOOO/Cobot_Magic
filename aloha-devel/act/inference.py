@@ -7,21 +7,21 @@
 import torch
 import numpy as np
 import os
-import pickle
-import argparse
-from einops import rearrange
+import pickle # 用于加载和保存模型的状态字典和统计数据
+import argparse # 用于解析命令行参数
+from einops import rearrange # 用于重排列张量的维度
 
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy, DiffusionPolicy
-import collections
-from collections import deque
+import collections # 有序字典
+from collections import deque # 双端队列
 
 import rospy
-from std_msgs.msg import Header
-from geometry_msgs.msg import Twist
-from sensor_msgs.msg import JointState, Image
-from nav_msgs.msg import Odometry
-from cv_bridge import CvBridge
+from std_msgs.msg import Header # ROS消息头
+from geometry_msgs.msg import Twist # ROS几何消息
+from sensor_msgs.msg import JointState, Image # 传感器消息
+from nav_msgs.msg import Odometry # 里程计消息
+from cv_bridge import CvBridge # OpenCV和ROS图像消息之间的转换
 import time
 import threading
 import math
@@ -38,15 +38,17 @@ inference_lock = threading.Lock()
 inference_actions = None
 inference_timestep = None
 
-
+# 动作插值函数
 def actions_interpolation(args, pre_action, actions, stats):
-    steps = np.concatenate((np.array(args.arm_steps_length), np.array(args.arm_steps_length)), axis=0)
-    pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
-    post_process = lambda a: a * stats['qpos_std'] + stats['qpos_mean']
+    steps = np.concatenate((np.array(args.arm_steps_length), np.array(args.arm_steps_length)), axis=0) # 左右臂拼接，14维
+    pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std'] # states qpos: 关节位置，归一化
+    post_process = lambda a: a * stats['qpos_std'] + stats['qpos_mean'] # actions后处理，反归一化
     result = [pre_action]
-    post_action = post_process(actions[0])
+    post_action = post_process(actions[0]) # actions shape: (chunk_size, state_dim)
     # print("pre_action:", pre_action[7:])
     # print("actions_interpolation1:", post_action[:, 7:])
+
+    # 找到归一化后变化最大的动作
     max_diff_index = 0
     max_diff = -1
     for i in range(post_action.shape[0]):
@@ -356,6 +358,23 @@ def model_inference(args, config, ros_operator, save_episode=True):
                 action = post_process(raw_action[0])
                 left_action = action[:7]  # 取7维度
                 right_action = action[7:14]
+
+                # 机械臂关节和夹爪拆开：
+                # 0~5 维是关节，6 维是夹爪；右臂同理 7~12 关节，13 夹爪
+                left_joints = left_action[:6]
+                left_gripper = left_action[6]
+
+                right_joints = right_action[:6]
+                right_gripper = right_action[6]
+
+                # 打印当前步的机械臂数据
+                print(f"[step {t}]")
+                print(f"  Left arm joints   (0-5): {left_joints}")
+                print(f"  Left gripper      (6)  : {left_gripper}")
+                print(f"  Right arm joints  (7-12 mapped): {right_joints}")
+                print(f"  Right gripper     (13) : {right_gripper}")
+                print("-" * 60)
+
                 ros_operator.puppet_arm_publish(left_action, right_action)  # puppet_arm_publish_continuous_thread
                 if args.use_robot_base:
                     vel_action = action[14:16]

@@ -156,6 +156,12 @@ def load_data(dataset_dir, num_episodes, arm_delay_time, use_depth_image,
     train_indices = shuffled_indices[:int(train_ratio * num_episodes)]
     val_indices = shuffled_indices[int(train_ratio * num_episodes):]
 
+        #兼容只有一个 episode 的情况
+    if num_episodes == 1:
+        print("[Warning] Only one episode found — using it for both training and validation.")
+        train_indices = [0]
+        val_indices = [0]
+
     # obtain normalization stats for qpos and action  返回均值和方差
     norm_stats = get_norm_stats(dataset_dir, num_episodes, use_robot_base)
 

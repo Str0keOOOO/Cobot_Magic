@@ -129,10 +129,10 @@ def make_policy(policy_class, policy_config, pretrain_ckpt_dir):
         policy = ACTPolicy(policy_config)
         if len(pretrain_ckpt_dir) != 0:
             state_dict = torch.load(pretrain_ckpt_dir)
+            
             loading_status = policy.deserialize(state_dict)
             if not loading_status:
                 print("ckpt path not exist")
-
     elif policy_class == 'CNNMLP':
         policy = CNNMLPPolicy(policy_config)
         if len(pretrain_ckpt_dir) != 0:
