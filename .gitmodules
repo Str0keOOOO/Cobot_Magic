@@ -1,4 +1,4 @@
-[submodule "remote_control"]
-	path = remote_control
-	url = https://mirror.ghproxy.com/https://github.com/agilexrobotics/remote_control.git
-	branch = can
+[submodule "collect_data/piper_sdk_demo"]
+	path = collect_data/piper_sdk_demo
+	url = https://github.com/agilexrobotics/piper_sdk_demo.git
+	branch = master

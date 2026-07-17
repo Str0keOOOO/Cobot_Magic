@@ -1,81 +1,82 @@
-# mobile-aloha
+# Cobot Magic
 
+本仓库包含 ALOHA/ACT 训练与推理代码、ROS 相机工作空间、数据采集脚本，以及 TiPToP bridge 相关代码。
 
-# 1 环境配置
+## 目录说明
 
-1. 下载cobot-magic工程
-~~~python
-git clone https://github.com/agilexrobotics/cobot_magic.git
-~~~
+- `aloha-devel/`：ACT、robomimic 训练与推理代码。
+- `camera_ws/`：ROS 相机工作空间和相机驱动源码。
+- `collect_data/`：数据采集和回放脚本；Piper SDK demo 位于其 Git submodule 中。
+- `tools/`：CAN、相机和工作空间辅助脚本。
 
-2. 编译
-~~~python
-cd cobot_magic/remote_control
-./tools/build.sh
+## Piper SDK demo（Git submodule）
 
-cd cobot_magic/camera_ws
+`collect_data/piper_sdk_demo` 是 AgileX Piper 机械臂的 CAN/SDK 示例，负责机械臂使能、状态读取、关节控制、主从臂配置和 MIT 模式配置。它不是训练日志或模型权重。
+
+主仓库只记录子模块提交指针；当前固定版本为 `f88fa63`。首次克隆时初始化子模块：
+
+```bash
+git clone --recurse-submodules https://github.com/Str0keOOOO/Cobot_Magic.git
+cd Cobot_Magic
+```
+
+已有工作区补齐子模块：
+
+```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+git submodule status
+```
+
+更新到上游 `master` 后，需要在主仓库提交新的子模块指针：
+
+```bash
+git -C collect_data/piper_sdk_demo fetch origin
+git -C collect_data/piper_sdk_demo checkout master
+git -C collect_data/piper_sdk_demo pull --ff-only
+git add collect_data/piper_sdk_demo
+git commit -m "Update Piper SDK demo"
+```
+
+当前本地子模块还有未提交的定制：删除部分 CAN/配置/读取示例，并修改了 `piper_joint_ctrl.py`、`piper_status.py`。这些改动不会随主仓库的子模块指针自动同步；如果需要让其他人复现，应在子模块中提交并推送，或导出补丁：
+
+```bash
+git -C collect_data/piper_sdk_demo diff > piper_sdk_demo.local.patch
+```
+
+## 运行和编译产物
+
+以下目录由本地运行或编译生成，不应提交到 Git：
+
+- `camera_ws/build/`、`camera_ws/devel/`
+- `Piper_ros_private-ros-noetic/build/`、`Piper_ros_private-ros-noetic/devel/`
+- Python 的 `__pycache__/`、`*.egg-info/`、`.bridge_deps/`
+- `*.log`、`**/output.txt`、训练 checkpoint 和数据文件
+
+ROS 工作空间编译（在 ROS Noetic 环境中）：
+
+```bash
+cd camera_ws
 catkin_make
-~~~
-
-
-2. 测试
-
-~~~python
-# 1 setup rule
-ls /dev/ttyACM*
-
-udevadm info -a -n /dev/ttyACM* | grep serial -m 1
-
-sudo vim /etc/udev/rules.d/arx_can.rules
-
-sudo udevadm control --reload && sudo  udevadm trigger
-
-# 2 start remote arm
-cd remote_control
-./tools/can.sh
-
-cd master1
-
 source devel/setup.bash
 
-roslaunch arm_control arx5v.launch
-~~~
+cd ../Piper_ros_private-ros-noetic
+catkin_make
+source devel/setup.bash
+```
 
+需要从头生成时，可先删除对应的 `build/` 和 `devel/`，再重新执行 `catkin_make`：
 
-# 3 采集数据
+```bash
+rm -rf camera_ws/build camera_ws/devel
+rm -rf Piper_ros_private-ros-noetic/build Piper_ros_private-ros-noetic/devel
+```
 
-~~~python
-# 1 启动roscore
-roscore
+TiPToP bridge 的 Python 依赖和可编辑安装：
 
-# 2 启动机器臂与相机
-./tools/remote.sh
+```bash
+python3 -m pip install -r requirements-tiptop-bridge.txt
+python3 -m pip install -e .
+```
 
-## 3 采集数据
-python collect_data.py --max_timesteps 500 --dataset_dir ./data --episode_idx 0
-~~~
-
-# 4 模型训练推理
-
-~~~python
-# 1 激活虚拟环境
-conda activate aloha
-
-# 2 训练
-python act/train.py --dataset_dir ~/data0314/ --ckpt_dir ~/train0314/ --batch_size 4 --num_epochs 3000
-
-# 3 推理
-## 3.1 只启动从臂
-cd remote_control
-./tools/puppet.sh
-
-## 3.2 启动推理代码
-python act/inference.py --ckpt_dir ~/train0314/
-~~~
-
----
-
-# 联系我们
-
-![](./collect_data/docs/1.jpg)
-
+训练数据、模型权重和推理输出建议放在仓库外部，例如 `~/cobot_magic_data/` 或 `~/cobot_magic_checkpoints/`，避免误提交设备数据和大文件。
