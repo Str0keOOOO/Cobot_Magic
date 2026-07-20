@@ -45,18 +45,15 @@ camera_server:
 
 # TiPToP reads only the selected right-wrist D435; it does not modify or start
 # a camera driver. multi_camera.launch maps serial 339222070351 to /camera_r
-# and enables its RGB-aligned depth stream. The bundled RealSense ROS driver
-# publishes 16UC1 depth values in millimetres (ROS_DEPTH_SCALE = 0.001 m).
+# and explicitly enables RGB, IR1 and IR2 at 640x480@30fps.
 cameras:
   right_wrist:
     namespace: "/camera_r"
     serial: "339222070351"
     role: "right_wrist"
     color_topic: "/camera_r/color/image_raw"
-    aligned_depth_topic: "/camera_r/aligned_depth_to_color/image_raw"
     color_info_topic: "/camera_r/color/camera_info"
-    left_ir_topic: null
-    right_ir_topic: null
-    ir_info_topic: null
-    depth_scale: 0.001
-    depth_source: "onboard_aligned"
+    left_ir_topic: "/camera_r/infra1/image_rect_raw"
+    right_ir_topic: "/camera_r/infra2/image_rect_raw"
+    left_ir_info_topic: "/camera_r/infra1/camera_info"
+    right_ir_info_topic: "/camera_r/infra2/camera_info"

@@ -1,4 +1,4 @@
-"""ROS RealSense snapshot cache for the Cobot Magic upper computer."""
+"""ROS RealSense implementation of TiPToP's remote camera contract."""
 
 from __future__ import annotations
 
@@ -14,23 +14,52 @@ from ..core.errors import CameraNotReadyError, ConfigurationError
 
 @dataclass(frozen=True)
 class RemoteCameraSnapshot:
+    """One hardware-synchronised RGB/left-IR/right-IR frame triplet."""
+
     serial: str
     timestamp: float
     rgb: np.ndarray
-    depth_m: np.ndarray | None
+    ir_left: np.ndarray
+    ir_right: np.ndarray
+
+
+@dataclass(frozen=True)
+class RemoteCameraIntrinsics:
+    """Calibration required by TiPToP's ``RemoteRealsenseCamera``."""
+
+    serial: str
     K_color: np.ndarray
     distortion_color: np.ndarray
-    left_ir_rgb: np.ndarray | None = None
-    right_ir_rgb: np.ndarray | None = None
-    K_ir: np.ndarray | None = None
-    baseline_ir_m: float | None = None
-    T_color_from_ir: np.ndarray | None = None
+    K_ir: np.ndarray
+    baseline_ir: float
+    T_color_from_ir: np.ndarray
+
+
+@dataclass(frozen=True)
+class _ColorInfo:
+    K: np.ndarray
+    D: np.ndarray
+    frame_id: str
+
+
+@dataclass(frozen=True)
+class _LeftIrInfo:
+    K: np.ndarray
+    frame_id: str
+
+
+@dataclass(frozen=True)
+class _RightIrInfo:
+    baseline_ir: float
 
 
 class CameraRosBridge:
-    """Continuously cache synchronized RGB/depth/CameraInfo frames.
+    """Cache RealSense RGB/IR frames and calibration for RPC reads.
 
-    RPC reads a copy of this cache; it never creates a subscriber per request.
+    RGB, IR1 and IR2 are the only members of the image synchroniser.  Their
+    CameraInfo messages are subscribed independently because they are usually
+    latched and must make ``get_intrinsics`` available before any image has
+    been received.
     """
 
     def __init__(
@@ -47,36 +76,39 @@ class CameraRosBridge:
         self.serial = self._required_str("serial")
         self.namespace = self._required_str("namespace")
         self.color_topic = self._required_str("color_topic")
-        self.aligned_depth_topic = self._optional_str("aligned_depth_topic")
+        self.left_ir_topic = self._required_str("left_ir_topic")
+        self.right_ir_topic = self._required_str("right_ir_topic")
         self.color_info_topic = self._required_str("color_info_topic")
-        self.left_ir_topic = self._optional_str("left_ir_topic")
-        self.right_ir_topic = self._optional_str("right_ir_topic")
-        self.ir_info_topic = self._optional_str("ir_info_topic")
-        raw_depth_scale = camera_config.get("depth_scale")
-        if self.aligned_depth_topic and raw_depth_scale is None:
-            raise ConfigurationError(
-                f"camera {self.role!r} depth_scale is unverified; refusing to guess depth units"
-            )
-        self.depth_scale = None if raw_depth_scale is None else float(raw_depth_scale)
-        if self.depth_scale is not None and (
-            not np.isfinite(self.depth_scale) or self.depth_scale <= 0
-        ):
-            raise ConfigurationError("camera depth_scale must be finite and positive")
+        self.left_ir_info_topic = self._required_str("left_ir_info_topic")
+        self.right_ir_info_topic = self._required_str("right_ir_info_topic")
+
         self.max_snapshot_age_s = float(server_config.get("max_snapshot_age_s", 0.25))
         self.sync_queue_size = int(server_config.get("sync_queue_size", 10))
         self.sync_slop_s = float(server_config.get("sync_slop_s", 0.05))
-        if self.max_snapshot_age_s <= 0 or self.sync_queue_size <= 0 or self.sync_slop_s < 0:
+        self.tf_timeout_s = float(server_config.get("tf_timeout_s", 0.2))
+        if (
+            self.max_snapshot_age_s <= 0
+            or self.sync_queue_size <= 0
+            or self.sync_slop_s < 0
+            or self.tf_timeout_s < 0
+        ):
             raise ConfigurationError("Invalid camera snapshot/synchronization configuration")
-        if bool(self.left_ir_topic) != bool(self.right_ir_topic):
-            raise ConfigurationError("Configure both IR streams or neither IR stream")
-        if self.left_ir_topic and not self.ir_info_topic:
-            raise ConfigurationError("IR streams require ir_info_topic")
 
         self._monotonic = monotonic
         self._snapshot_lock = threading.Lock()
         self._latest_snapshot: RemoteCameraSnapshot | None = None
         self._snapshot_received_monotonic: float | None = None
+
+        self._intrinsics_lock = threading.Lock()
+        self._latest_intrinsics: RemoteCameraIntrinsics | None = None
+        self._intrinsics_error: str | None = None
+        self._color_info: _ColorInfo | None = None
+        self._left_ir_info: _LeftIrInfo | None = None
+        self._right_ir_info: _RightIrInfo | None = None
+
         self._subscriber_handles: list[Any] = []
+        self._rospy: Any | None = None
+        self._tf_buffer: Any | None = None
         if autostart:
             self.start()
 
@@ -86,51 +118,52 @@ class CameraRosBridge:
             raise ConfigurationError(f"camera {self.role!r} requires {key}")
         return value
 
-    def _optional_str(self, key: str) -> str | None:
-        value = self.config.get(key)
-        if value is None:
-            return None
-        value = str(value).strip()
-        return value or None
-
     def start(self) -> None:
-        """Create the one long-lived ApproximateTimeSynchronizer for this camera."""
+        """Start long-lived image, CameraInfo and TF subscribers."""
         try:
-            import rospy  # type: ignore
             import message_filters  # type: ignore
+            import rospy  # type: ignore
+            import tf2_ros  # type: ignore
             from cv_bridge import CvBridge  # type: ignore
             from sensor_msgs.msg import CameraInfo, Image  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
                 "CameraRosBridge must run in a sourced ROS1/cv_bridge environment"
             ) from exc
+
         self._rospy = rospy
         self._ensure_ros_node()
         self._cv_bridge = CvBridge()
-        subscribers = [
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer)
+
+        image_subscribers = [
             message_filters.Subscriber(self.color_topic, Image),
+            message_filters.Subscriber(self.left_ir_topic, Image),
+            message_filters.Subscriber(self.right_ir_topic, Image),
         ]
-        if self.aligned_depth_topic:
-            subscribers.append(message_filters.Subscriber(self.aligned_depth_topic, Image))
-        subscribers.append(message_filters.Subscriber(self.color_info_topic, CameraInfo))
-        if self.left_ir_topic:
-            subscribers.extend(
-                [
-                    message_filters.Subscriber(self.left_ir_topic, Image),
-                    message_filters.Subscriber(self.right_ir_topic, Image),
-                    message_filters.Subscriber(self.ir_info_topic, CameraInfo),
-                ]
-            )
         synchronizer = message_filters.ApproximateTimeSynchronizer(
-            subscribers,
+            image_subscribers,
             queue_size=self.sync_queue_size,
             slop=self.sync_slop_s,
         )
-        synchronizer.registerCallback(self._ros_callback)
-        self._subscriber_handles = subscribers + [synchronizer]
+        synchronizer.registerCallback(self._ros_image_callback)
+
+        info_subscribers = [
+            rospy.Subscriber(self.color_info_topic, CameraInfo, self._color_info_callback),
+            rospy.Subscriber(
+                self.left_ir_info_topic, CameraInfo, self._left_ir_info_callback
+            ),
+            rospy.Subscriber(
+                self.right_ir_info_topic, CameraInfo, self._right_ir_info_callback
+            ),
+        ]
+        self._subscriber_handles = image_subscribers + [synchronizer] + info_subscribers
 
     def _ensure_ros_node(self) -> None:
         """Initialise the ROS node before registering camera subscribers."""
+        if self._rospy is None:
+            raise RuntimeError("ROS has not been imported")
         core = getattr(self._rospy, "core", None)
         is_initialized = getattr(core, "is_initialized", None)
         if callable(is_initialized) and is_initialized():
@@ -140,143 +173,250 @@ class CameraRosBridge:
             raise RuntimeError("rospy does not provide init_node")
         init_node("cobot_magic_tiptop_camera_bridge", anonymous=True)
 
-    def _ros_callback(self, *messages: Any) -> None:
-        color = messages[0]
-        if self.aligned_depth_topic:
-            depth = messages[1]
-            color_info = messages[2]
-            ir = messages[3:]
-        else:
-            depth = None
-            color_info = messages[1]
-            ir = messages[2:]
-        bgr = self._cv_bridge.imgmsg_to_cv2(color, desired_encoding="bgr8")
-        rgb = np.ascontiguousarray(bgr[..., ::-1], dtype=np.uint8)
-        depth_m = None
-        if depth is not None:
-            raw_depth = self._cv_bridge.imgmsg_to_cv2(depth, desired_encoding="passthrough")
-            depth_m = self._depth_to_meters(raw_depth, getattr(depth, "encoding", ""))
-        K_color, distortion_color = self._camera_info(color_info)
-        left_ir_rgb = right_ir_rgb = K_ir = None
-        if ir:
-            left, right, ir_info = ir
-            left_ir_rgb = self._ir_to_rgb(
-                self._cv_bridge.imgmsg_to_cv2(left, desired_encoding="passthrough")
-            )
-            right_ir_rgb = self._ir_to_rgb(
-                self._cv_bridge.imgmsg_to_cv2(right, desired_encoding="passthrough")
-            )
-            K_ir, _ = self._camera_info(ir_info)
-        stamp = getattr(getattr(color, "header", None), "stamp", None)
-        timestamp = float(stamp.to_sec()) if stamp is not None else time.time()
+    def _ros_image_callback(self, color: Any, left: Any, right: Any) -> None:
+        """Convert one synchronised RGB/IR1/IR2 ROS frame triplet."""
+        rgb = self._as_rgb(self._cv_bridge.imgmsg_to_cv2(color, desired_encoding="rgb8"))
+        ir_left = self._as_ir_gray(
+            self._cv_bridge.imgmsg_to_cv2(left, desired_encoding="passthrough")
+        )
+        ir_right = self._as_ir_gray(
+            self._cv_bridge.imgmsg_to_cv2(right, desired_encoding="passthrough")
+        )
+        timestamps = (
+            self._stamp_seconds(color),
+            self._stamp_seconds(left),
+            self._stamp_seconds(right),
+        )
+        if max(timestamps) - min(timestamps) > self.sync_slop_s:
+            raise ValueError("RGB and IR image stamps exceed the configured sync slop")
         self.update_snapshot(
-            timestamp=timestamp,
-            rgb=rgb,
-            depth_m=depth_m,
-            K_color=K_color,
-            distortion_color=distortion_color,
-            left_ir_rgb=left_ir_rgb,
-            right_ir_rgb=right_ir_rgb,
-            K_ir=K_ir,
+            timestamp=timestamps[0], rgb=rgb, ir_left=ir_left, ir_right=ir_right
         )
 
-    def _depth_to_meters(self, raw_depth: Any, encoding: str) -> np.ndarray:
-        if self.depth_scale is None:
-            raise RuntimeError("Depth image received without a configured depth_scale")
-        depth = np.asarray(raw_depth)
-        if depth.ndim != 2:
-            raise ValueError(f"Depth image must be [H,W], got {depth.shape}")
-        if np.issubdtype(depth.dtype, np.floating):
-            # RealSense 32FC1 images conventionally carry metres.  Do not apply
-            # the uint16 depth scale a second time.
-            scale = 1.0
-        elif np.issubdtype(depth.dtype, np.integer):
-            scale = self.depth_scale
-        else:
-            raise ValueError(f"Unsupported depth dtype {depth.dtype} ({encoding})")
-        result = np.ascontiguousarray(depth, dtype=np.float32) * np.float32(scale)
-        if not np.all(np.isfinite(result) | np.isnan(result)):
-            raise ValueError("Depth contains unsupported non-finite values")
-        return result
+    @staticmethod
+    def _stamp_seconds(message: Any) -> float:
+        stamp = getattr(getattr(message, "header", None), "stamp", None)
+        to_sec = getattr(stamp, "to_sec", None)
+        if not callable(to_sec):
+            raise ValueError("Synchronized ROS image is missing header.stamp")
+        timestamp = float(to_sec())
+        if not np.isfinite(timestamp):
+            raise ValueError("Synchronized ROS image header.stamp must be finite")
+        return timestamp
 
     @staticmethod
-    def _ir_to_rgb(raw_ir: Any) -> np.ndarray:
-        image = np.asarray(raw_ir)
-        if image.ndim != 2 or image.dtype != np.uint8:
-            raise ValueError("IR image must be an 8-bit single-channel image")
-        return np.ascontiguousarray(np.repeat(image[..., None], 3, axis=2))
+    def _as_rgb(image: Any) -> np.ndarray:
+        result = np.asarray(image)
+        if result.dtype != np.uint8 or result.ndim != 3 or result.shape[2] != 3:
+            raise ValueError("RGB image must be uint8 [H,W,3] in RGB channel order")
+        return np.ascontiguousarray(result)
 
     @staticmethod
-    def _camera_info(info: Any) -> tuple[np.ndarray, np.ndarray]:
+    def _as_ir_gray(image: Any) -> np.ndarray:
+        result = np.asarray(image)
+        if result.dtype != np.uint8 or result.ndim != 2:
+            raise ValueError("IR image must be a uint8 [H,W] single-channel grayscale image")
+        return np.ascontiguousarray(result)
+
+    def _color_info_callback(self, info: Any) -> None:
+        K, D = self._camera_info(info, require_five_distortion=True)
+        color_info = _ColorInfo(K=K, D=D, frame_id=self._frame_id(info, "color"))
+        with self._intrinsics_lock:
+            self._color_info = color_info
+            self._latest_intrinsics = None
+            self._intrinsics_error = None
+        self._refresh_intrinsics_from_ros()
+
+    def _left_ir_info_callback(self, info: Any) -> None:
+        K, _ = self._camera_info(info, require_five_distortion=False)
+        left_ir_info = _LeftIrInfo(K=K, frame_id=self._frame_id(info, "left IR"))
+        with self._intrinsics_lock:
+            self._left_ir_info = left_ir_info
+            self._latest_intrinsics = None
+            self._intrinsics_error = None
+        self._refresh_intrinsics_from_ros()
+
+    def _right_ir_info_callback(self, info: Any) -> None:
+        right_ir_info = _RightIrInfo(baseline_ir=self._baseline_from_right_info(info))
+        with self._intrinsics_lock:
+            self._right_ir_info = right_ir_info
+            self._latest_intrinsics = None
+            self._intrinsics_error = None
+        self._refresh_intrinsics_from_ros()
+
+    @staticmethod
+    def _camera_info(
+        info: Any, *, require_five_distortion: bool
+    ) -> tuple[np.ndarray, np.ndarray]:
         K = np.asarray(getattr(info, "K", ()), dtype=np.float32)
         D = np.asarray(getattr(info, "D", ()), dtype=np.float32)
         if K.shape != (9,) or not np.all(np.isfinite(K)):
             raise ValueError("CameraInfo.K must contain nine finite values")
         if not np.all(np.isfinite(D)):
             raise ValueError("CameraInfo.D must contain finite values")
+        if require_five_distortion and D.shape != (5,):
+            raise ValueError("color CameraInfo.D must contain exactly five values")
         return np.ascontiguousarray(K.reshape(3, 3)), np.ascontiguousarray(D)
+
+    @staticmethod
+    def _frame_id(info: Any, stream_name: str) -> str:
+        frame_id = str(getattr(getattr(info, "header", None), "frame_id", "")).strip()
+        if not frame_id:
+            raise ValueError(f"{stream_name} CameraInfo.header.frame_id is required")
+        return frame_id
+
+    @staticmethod
+    def _baseline_from_right_info(info: Any) -> float:
+        P = np.asarray(getattr(info, "P", ()), dtype=np.float64)
+        if P.shape != (12,) or not np.all(np.isfinite(P)):
+            raise ValueError("right IR CameraInfo.P must contain twelve finite values")
+        if P[0] == 0:
+            raise ValueError("right IR CameraInfo.P[0,0] must be non-zero")
+        baseline_ir = float(abs(P[3] / P[0]))
+        if not np.isfinite(baseline_ir) or baseline_ir <= 0:
+            raise ValueError("right IR CameraInfo.P must encode a positive baseline in metres")
+        return baseline_ir
+
+    def _refresh_intrinsics_from_ros(self) -> None:
+        """Attempt calibration refresh after CameraInfo or an RPC request.
+
+        A TF lookup can legitimately fail while the driver is starting.  That
+        failure is cached as readiness information and retried by each later
+        CameraInfo callback and by ``read_intrinsics``.
+        """
+        with self._intrinsics_lock:
+            color_info = self._color_info
+            left_ir_info = self._left_ir_info
+            right_ir_info = self._right_ir_info
+        if color_info is None or left_ir_info is None or right_ir_info is None:
+            return
+        if self._tf_buffer is None or self._rospy is None:
+            return
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                color_info.frame_id,
+                left_ir_info.frame_id,
+                self._rospy.Time(0),
+                self._rospy.Duration(self.tf_timeout_s),
+            )
+            T_color_from_ir = self._transform_matrix(transform)
+            self.update_intrinsics(
+                K_color=color_info.K,
+                distortion_color=color_info.D,
+                K_ir=left_ir_info.K,
+                baseline_ir=right_ir_info.baseline_ir,
+                T_color_from_ir=T_color_from_ir,
+            )
+        except Exception as exc:
+            with self._intrinsics_lock:
+                self._intrinsics_error = (
+                    "Waiting for TF transform "
+                    f"{color_info.frame_id!r} <- {left_ir_info.frame_id!r}: {exc}"
+                )
+
+    @staticmethod
+    def _transform_matrix(transform_stamped: Any) -> np.ndarray:
+        transform = getattr(transform_stamped, "transform", transform_stamped)
+        translation = getattr(transform, "translation", None)
+        rotation = getattr(transform, "rotation", None)
+        values = np.asarray(
+            [
+                getattr(translation, "x", np.nan),
+                getattr(translation, "y", np.nan),
+                getattr(translation, "z", np.nan),
+                getattr(rotation, "x", np.nan),
+                getattr(rotation, "y", np.nan),
+                getattr(rotation, "z", np.nan),
+                getattr(rotation, "w", np.nan),
+            ],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("TF color-from-left-IR transform must be finite")
+        tx, ty, tz, x, y, z, w = values
+        norm = float(np.linalg.norm((x, y, z, w)))
+        if norm == 0:
+            raise ValueError("TF color-from-left-IR transform has a zero quaternion")
+        x, y, z, w = x / norm, y / norm, z / norm, w / norm
+        T = np.eye(4, dtype=np.float32)
+        T[:3, :3] = np.asarray(
+            [
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            ],
+            dtype=np.float32,
+        )
+        T[:3, 3] = np.asarray((tx, ty, tz), dtype=np.float32)
+        return T
+
+    def update_intrinsics(
+        self,
+        *,
+        K_color: np.ndarray,
+        distortion_color: np.ndarray,
+        K_ir: np.ndarray,
+        baseline_ir: float,
+        T_color_from_ir: np.ndarray,
+    ) -> None:
+        """Store calibration independently of image arrival (also test hook)."""
+        K_color = self._finite_array(K_color, (3, 3), "K_color")
+        distortion_color = self._finite_array(
+            distortion_color, (5,), "distortion_color"
+        )
+        K_ir = self._finite_array(K_ir, (3, 3), "K_ir")
+        T_color_from_ir = self._finite_array(
+            T_color_from_ir, (4, 4), "T_color_from_ir"
+        )
+        if not np.array_equal(
+            T_color_from_ir[3], np.asarray((0, 0, 0, 1), dtype=np.float32)
+        ):
+            raise ValueError("T_color_from_ir last row must be [0, 0, 0, 1]")
+        baseline_ir = float(baseline_ir)
+        if not np.isfinite(baseline_ir) or baseline_ir <= 0:
+            raise ValueError("baseline_ir must be finite and positive (metres)")
+        intrinsics = RemoteCameraIntrinsics(
+            serial=self.serial,
+            K_color=K_color.copy(),
+            distortion_color=distortion_color.copy(),
+            K_ir=K_ir.copy(),
+            baseline_ir=baseline_ir,
+            T_color_from_ir=T_color_from_ir.copy(),
+        )
+        with self._intrinsics_lock:
+            self._latest_intrinsics = intrinsics
+            self._intrinsics_error = None
+
+    @staticmethod
+    def _finite_array(value: Any, shape: tuple[int, ...], name: str) -> np.ndarray:
+        result = np.ascontiguousarray(value, dtype=np.float32)
+        if result.shape != shape or not np.all(np.isfinite(result)):
+            raise ValueError(f"{name} must have shape {shape} with finite values")
+        return result
 
     def update_snapshot(
         self,
         *,
         timestamp: float,
         rgb: np.ndarray,
-        depth_m: np.ndarray | None,
-        K_color: np.ndarray,
-        distortion_color: np.ndarray,
-        left_ir_rgb: np.ndarray | None = None,
-        right_ir_rgb: np.ndarray | None = None,
-        K_ir: np.ndarray | None = None,
-        baseline_ir_m: float | None = None,
-        T_color_from_ir: np.ndarray | None = None,
+        ir_left: np.ndarray,
+        ir_right: np.ndarray,
     ) -> None:
-        """Store an immutable-by-convention copy; used directly by unit tests."""
-        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
-        if rgb.ndim != 3 or rgb.shape[2] != 3:
-            raise ValueError(f"RGB image must be uint8 [H,W,3], got {rgb.shape}")
-        if depth_m is not None:
-            depth_m = np.ascontiguousarray(depth_m, dtype=np.float32)
-            if depth_m.shape != rgb.shape[:2]:
-                raise ValueError("Depth must have the same [H,W] as RGB")
-        K_color = np.ascontiguousarray(K_color, dtype=np.float32)
-        distortion_color = np.ascontiguousarray(distortion_color, dtype=np.float32)
-        if K_color.shape != (3, 3):
-            raise ValueError("K_color must have shape (3, 3)")
-        if (left_ir_rgb is None) != (right_ir_rgb is None):
-            raise ValueError("Both IR frames must be present or both omitted")
-        if left_ir_rgb is not None:
-            left_ir_rgb = np.ascontiguousarray(left_ir_rgb, dtype=np.uint8)
-            right_ir_rgb = np.ascontiguousarray(right_ir_rgb, dtype=np.uint8)
-            if left_ir_rgb.ndim != 3 or left_ir_rgb.shape[2] != 3:
-                raise ValueError("Left IR RGB image must be [H,W,3]")
-            if right_ir_rgb.shape != left_ir_rgb.shape:
-                raise ValueError("IR image shapes must match")
-        if K_ir is not None:
-            K_ir = np.ascontiguousarray(K_ir, dtype=np.float32)
-            if K_ir.shape != (3, 3):
-                raise ValueError("K_ir must have shape (3, 3)")
-        if baseline_ir_m is not None and (
-            not np.isfinite(baseline_ir_m) or baseline_ir_m <= 0
-        ):
-            raise ValueError("baseline_ir_m must be finite and positive")
-        if T_color_from_ir is not None:
-            T_color_from_ir = np.ascontiguousarray(T_color_from_ir, dtype=np.float32)
-            if T_color_from_ir.shape != (4, 4):
-                raise ValueError("T_color_from_ir must have shape (4, 4)")
+        """Store one validated RGB/IR triplet; used directly by unit tests."""
+        timestamp = float(timestamp)
+        if not np.isfinite(timestamp):
+            raise ValueError("timestamp must be finite")
+        rgb = self._as_rgb(rgb)
+        ir_left = self._as_ir_gray(ir_left)
+        ir_right = self._as_ir_gray(ir_right)
+        if rgb.shape[:2] != ir_left.shape or ir_left.shape != ir_right.shape:
+            raise ValueError("RGB, left IR and right IR resolutions must match exactly")
         snapshot = RemoteCameraSnapshot(
             serial=self.serial,
-            timestamp=float(timestamp),
+            timestamp=timestamp,
             rgb=rgb.copy(),
-            depth_m=None if depth_m is None else depth_m.copy(),
-            K_color=K_color.copy(),
-            distortion_color=distortion_color.copy(),
-            left_ir_rgb=None if left_ir_rgb is None else left_ir_rgb.copy(),
-            right_ir_rgb=None if right_ir_rgb is None else right_ir_rgb.copy(),
-            K_ir=None if K_ir is None else K_ir.copy(),
-            baseline_ir_m=baseline_ir_m,
-            T_color_from_ir=(
-                None if T_color_from_ir is None else T_color_from_ir.copy()
-            ),
+            ir_left=ir_left.copy(),
+            ir_right=ir_right.copy(),
         )
         with self._snapshot_lock:
             self._latest_snapshot = snapshot
@@ -288,7 +428,7 @@ class CameraRosBridge:
             received = self._snapshot_received_monotonic
         if snapshot is None or received is None:
             raise CameraNotReadyError(
-                f"No synchronized snapshot received for {self.namespace}"
+                f"No synchronized RGB/IR snapshot received for {self.namespace}"
             )
         age = self._monotonic() - received
         if age > self.max_snapshot_age_s:
@@ -297,10 +437,26 @@ class CameraRosBridge:
             )
         return snapshot
 
+    def read_intrinsics(self) -> RemoteCameraIntrinsics:
+        """Return calibration even when no image snapshot has arrived yet."""
+        self._refresh_intrinsics_from_ros()
+        with self._intrinsics_lock:
+            intrinsics = self._latest_intrinsics
+            error = self._intrinsics_error
+        if intrinsics is None:
+            detail = f" ({error})" if error else ""
+            raise CameraNotReadyError(
+                f"Camera calibration is not ready for {self.namespace}{detail}"
+            )
+        return intrinsics
+
     def health(self) -> dict[str, Any]:
         with self._snapshot_lock:
             received = self._snapshot_received_monotonic
             snapshot = self._latest_snapshot
+        with self._intrinsics_lock:
+            intrinsics = self._latest_intrinsics
+            intrinsics_error = self._intrinsics_error
         age = None if received is None else max(0.0, self._monotonic() - received)
         return {
             "namespace": self.namespace,
@@ -308,8 +464,9 @@ class CameraRosBridge:
             "role": self.role,
             "snapshot_received": snapshot is not None,
             "snapshot_age_s": age,
-            "has_ir": bool(self.left_ir_topic),
-            "has_depth": snapshot is not None and snapshot.depth_m is not None,
+            "calibration_ready": intrinsics is not None,
+            "calibration_error": intrinsics_error,
+            "has_ir": True,
         }
 
     def close(self) -> None:

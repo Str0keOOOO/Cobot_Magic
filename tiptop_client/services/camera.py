@@ -7,7 +7,11 @@ from typing import Any
 import zmq
 
 from ..core.errors import BridgeError, CameraNotReadyError
-from ..ros.camera_bridge import CameraRosBridge, RemoteCameraSnapshot
+from ..ros.camera_bridge import (
+    CameraRosBridge,
+    RemoteCameraIntrinsics,
+    RemoteCameraSnapshot,
+)
 from ..core.protocol import (
     PROTOCOL_VERSION,
     make_error,
@@ -134,10 +138,12 @@ class CobotMagicCameraServer:
             serial = params.get("serial")
             if not isinstance(serial, str) or not serial:
                 raise ValueError("serial must be a non-empty string")
-            snapshot = self._camera_by_serial(serial).read_snapshot()
+            camera = self._camera_by_serial(serial)
             if op == "get_intrinsics":
-                return self._intrinsics_result(snapshot)
-            return self._snapshot_result(snapshot)
+                # Calibration is cached from CameraInfo/TF and intentionally
+                # does not wait for a synchronized image triplet.
+                return self._intrinsics_result(camera.read_intrinsics())
+            return self._snapshot_result(camera.read_snapshot())
         raise AssertionError(op)
 
     @staticmethod
@@ -153,29 +159,24 @@ class CobotMagicCameraServer:
         raise ValueError(f"Unknown camera serial: {serial}")
 
     @staticmethod
-    def _intrinsics_result(snapshot: RemoteCameraSnapshot) -> dict[str, Any]:
+    def _intrinsics_result(intrinsics: RemoteCameraIntrinsics) -> dict[str, Any]:
         return {
-            "serial": snapshot.serial,
-            # TiPToP clients use the ROS-style K_color name.  Keep the
-            # original generic alias for backwards compatibility.
-            "K_color": snapshot.K_color,
-            "intrinsics": snapshot.K_color,
-            "distortion_color": snapshot.distortion_color,
-            "K_ir": snapshot.K_ir,
-            "baseline_ir_m": snapshot.baseline_ir_m,
-            "T_color_from_ir": snapshot.T_color_from_ir,
+            "serial": intrinsics.serial,
+            "K_color": intrinsics.K_color,
+            "distortion_color": intrinsics.distortion_color,
+            "K_ir": intrinsics.K_ir,
+            "baseline_ir": intrinsics.baseline_ir,
+            "T_color_from_ir": intrinsics.T_color_from_ir,
         }
 
-    @classmethod
-    def _snapshot_result(cls, snapshot: RemoteCameraSnapshot) -> dict[str, Any]:
+    @staticmethod
+    def _snapshot_result(snapshot: RemoteCameraSnapshot) -> dict[str, Any]:
         return {
             "serial": snapshot.serial,
             "timestamp": snapshot.timestamp,
             "rgb": snapshot.rgb,
-            "depth": snapshot.depth_m,
-            **cls._intrinsics_result(snapshot),
-            "left_ir_rgb": snapshot.left_ir_rgb,
-            "right_ir_rgb": snapshot.right_ir_rgb,
+            "ir_left": snapshot.ir_left,
+            "ir_right": snapshot.ir_right,
         }
 
     def close(self) -> None:

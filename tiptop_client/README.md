@@ -9,7 +9,7 @@
 每次开机，或每次重新插拔 CAN 模块后，都必须先执行：
 
 ```bash
-cd /home/agilex/xuchenfei/cobot_magic/Piper_ros_private-ros-noetic
+cd Cobot_Magic/Piper_ros_private-ros-noetic/
 bash can_config.sh
 ```
 
@@ -24,7 +24,7 @@ roscore
 启动前先将机械臂断电重启，并**拔掉主臂的航空插头**。
 
 ```bash
-cd /home/agilex/xuchenfei/cobot_magic/Piper_ros_private-ros-noetic
+cd /home/agilex/xuchenfei/Cobot_Magic/Piper_ros_private-ros-noetic
 source devel/setup.bash
 roslaunch piper start_ms_piper.launch mode:=1 auto_enable:=true
 ```
@@ -32,13 +32,10 @@ roslaunch piper start_ms_piper.launch mode:=1 auto_enable:=true
 ### 3. 终端三：启动三台 Intel RealSense 相机
 
 ```bash
-cd /home/agilex/xuchenfei/cobot_magic/camera_ws
+cd /home/agilex/xuchenfei/Cobot_Magic/Piper_ros_private-ros-noetic
 source devel/setup.bash
-roslaunch /home/agilex/xuchenfei/cobot_magic/camera_ws/src/realsense-ros/realsense2_camera/launch/multi_camera.launch
+roslaunch realsense2_camera multi_camera.launch
 ```
-
-必须启动仓库中这份 `multi_camera.launch`。不要只运行
-`roslaunch realsense2_camera multi_camera.launch`，否则 ROS 可能从环境变量中找到其他工作区或系统安装的同名 launch 文件。
 
 ## 二、TiPToP 桥接服务：端口、能力与启动
 
@@ -46,10 +43,10 @@ roslaunch /home/agilex/xuchenfei/cobot_magic/camera_ws/src/realsense-ros/realsen
 
 ### 1. 集中启动命令
 
-首次使用时，在上位机安装客户端依赖：
+首次使用时，在上位机安装客户端依赖（ALOHA不要安装）：
 
 ```bash
-cd /home/agilex/xuchenfei/cobot_magic
+cd /home/agilex/xuchenfei/Cobot_Magic
 python3 -m pip install -r tiptop_client/requirements.txt
 ```
 
@@ -57,43 +54,15 @@ python3 -m pip install -r tiptop_client/requirements.txt
 
 ```bash
 # 终端四：控制桥接
-cd /home/agilex/xuchenfei/cobot_magic
-source /opt/ros/noetic/setup.bash
-source Piper_ros_private-ros-noetic/devel/setup.bash
-source camera_ws/devel/setup.bash
+cd /home/agilex/xuchenfei/Cobot_Magic
 python3 -m tiptop_client controller-server --config tiptop_client/config.yaml
 ```
 
 ```bash
 # 终端五：相机桥接
-cd /home/agilex/xuchenfei/cobot_magic
-source /opt/ros/noetic/setup.bash
-source Piper_ros_private-ros-noetic/devel/setup.bash
-source camera_ws/devel/setup.bash
+cd /home/agilex/xuchenfei/Cobot_Magic
 python3 -m tiptop_client camera-server --config tiptop_client/config.yaml
 ```
-
-## 三、测试
-
-`tests/` 是客户端的自动测试目录，使用假的 ROS、机械臂和相机对象验证逻辑，**不会连接或控制真实硬件**。
-
-| 文件 | 验证内容 |
-| --- | --- |
-| `test_config.py` | YAML 配置加载、默认值和错误配置处理。 |
-| `test_protocol.py` | MessagePack RPC 的请求、响应和协议版本校验。 |
-| `test_ros_backend.py` | 关节限位、速度、轨迹插补、夹爪和停止逻辑。 |
-| `test_controller_server.py` | 5555 控制服务的 RPC 请求处理。 |
-| `test_camera_ros.py` | ROS 图像、深度、内参转换和快照缓存。 |
-| `test_camera_server.py` | 5556 相机服务返回的图像、深度和内参。 |
-| `fakes.py` | 供测试使用的假 ROS、机械臂和相机对象。 |
-
-安装 `requirements.txt` 中的依赖后，在仓库根目录运行：
-
-```bash
-python3 -m unittest discover -s tiptop_client/tests -t . -v
-```
-
-这只能验证客户端逻辑；真机联调仍需按本文前两部分启动 ROS、机械臂、相机和两个桥接服务。
 
 ### 2. 端口
 
@@ -127,5 +96,10 @@ python3 -m unittest discover -s tiptop_client/tests -t . -v
 | `ping` | 无 | 服务名和协议版本。 |
 | `health` | 无 | 每台已配置相机的运行状态。 |
 | `list_cameras` | 无 | 已配置相机的 `namespace`、`serial` 和 `role`。 |
-| `get_intrinsics` | 必填 `serial` | 对应相机的 `K_color`/`intrinsics`、彩色相机畸变参数 `distortion_color`，以及可选的 IR 内参、IR baseline 和 IR 到彩色相机的变换。 |
-| `read_camera` | 必填 `serial` | **最新一份已同步缓存快照**：`rgb`、以米为单位的 `depth`、`timestamp`、`serial` 和上述内参；只有在配置了 IR topic 时才包含左右 IR 图像。它是按请求读取快照，不是持续视频推流。若没有新鲜的 ROS 图像/深度/相机信息，会返回错误。 |
+| `get_intrinsics` | 必填 `serial` | 不依赖图像到达顺序，返回 `serial`、`K_color: float32[3,3]`、`distortion_color: float32[5]`、`K_ir: float32[3,3]`、`baseline_ir`（米）和 `T_color_from_ir: float32[4,4]`。`K_color`/`D` 来自 color CameraInfo，`K_ir` 来自 IR1 CameraInfo，baseline 从 IR2 的 `abs(P[0,3] / P[0,0])` 计算，TF 查询方向为 color optical frame ← IR1 optical frame。 |
+| `read_camera` | 必填 `serial` | **最新一份 RGB、IR1、IR2 同步缓存快照**：`serial`、有限的 ROS `header.stamp` 时间戳 `timestamp`、RGB `uint8[H,W,3]`（RGB 通道顺序）、`ir_left: uint8[H,W]` 和 `ir_right: uint8[H,W]`。三张图的空间分辨率必须完全相同；IR 不会复制为三通道。 |
+
+`multi_camera.launch` 已对 `/camera_r` 明确启用 color、infra1 和 infra2 的
+`640×480@30fps` 流，并打开 RealSense `enable_sync`。桥接服务使用
+`/camera_r/color/image_raw`、`/camera_r/infra1/image_rect_raw` 和
+`/camera_r/infra2/image_rect_raw`；不要用 ZED 或用伪彩色 IR 数据替代这些流。
