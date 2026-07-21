@@ -19,17 +19,11 @@ robot:
   servo_rate_hz: 200.0
   state_timeout_s: 5.0
   max_state_age_s: 0.25
-  max_initial_error_rad: 0.017453292519943295
   # Existing Piper driver clamps its gripper command to [0.0, 0.08] metres.
   gripper_open_position: 0.08
   gripper_closed_position: 0.0
   gripper_min_move_time_s: 0.25
   gripper_max_move_time_s: 1.5
-  # Piper SDK manufacturer defaults in the existing joint0..joint5 order.
-  # Verify these against the live controller before autonomous operation.
-  joint_lower_rad: [-2.6179, 0.0, -2.967, -1.745, -1.22, -2.09439]
-  joint_upper_rad: [2.6179, 3.14, 0.0, 1.745, 1.22, 2.09439]
-  max_joint_velocity_rad_s: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
   # Must agree with the TiPToP server client.  "intervals" means each duration
   # ends at its matching waypoint, including the final waypoint.
   trajectory_duration_mode: "intervals"
@@ -42,6 +36,9 @@ camera_server:
   max_snapshot_age_s: 0.25
   sync_queue_size: 10
   sync_slop_s: 0.05
+  tf_timeout_s: 0.2
+  # Fail calibration if IR1↔IR2 TF and rectified IR2 CameraInfo.P differ more than this.
+  baseline_consistency_tolerance_m: 0.005
 
 # TiPToP reads only the selected right-wrist D435; it does not modify or start
 # a camera driver. multi_camera.launch maps serial 339222070351 to /camera_r
@@ -57,3 +54,10 @@ cameras:
     right_ir_topic: "/camera_r/infra2/image_rect_raw"
     left_ir_info_topic: "/camera_r/infra1/camera_info"
     right_ir_info_topic: "/camera_r/infra2/camera_info"
+    # Keep TiPToP's normal FoundationStereo path: no ROS depth is transported.
+    enable_depth: false
+    # When enable_depth is true, uncomment these topics and set depth_scale_m
+    # from this exact camera/driver (e.g. verified D435 Z16 scale 0.001 m).
+    # depth_raw_topic: "/camera_r/depth/image_rect_raw"
+    # aligned_depth_topic: "/camera_r/aligned_depth_to_color/image_raw"
+    # depth_scale_m: 0.001

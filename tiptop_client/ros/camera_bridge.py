@@ -21,6 +21,8 @@ class RemoteCameraSnapshot:
     rgb: np.ndarray
     ir_left: np.ndarray
     ir_right: np.ndarray
+    depth: np.ndarray | None = None
+    depth_raw: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -50,7 +52,8 @@ class _LeftIrInfo:
 
 @dataclass(frozen=True)
 class _RightIrInfo:
-    baseline_ir: float
+    frame_id: str
+    baseline_from_projection_m: float | None
 
 
 class CameraRosBridge:
@@ -75,22 +78,49 @@ class CameraRosBridge:
         self.config = camera_config
         self.serial = self._required_str("serial")
         self.namespace = self._required_str("namespace")
+        if self.serial in {self.role, self.namespace, self.namespace.strip("/")}:
+            raise ConfigurationError(
+                "camera serial must be a RealSense device serial, not a role/namespace"
+            )
         self.color_topic = self._required_str("color_topic")
         self.left_ir_topic = self._required_str("left_ir_topic")
         self.right_ir_topic = self._required_str("right_ir_topic")
         self.color_info_topic = self._required_str("color_info_topic")
         self.left_ir_info_topic = self._required_str("left_ir_info_topic")
         self.right_ir_info_topic = self._required_str("right_ir_info_topic")
+        self.enable_depth = bool(camera_config.get("enable_depth", False))
+        self.depth_raw_topic = self._optional_str("depth_raw_topic")
+        self.aligned_depth_topic = self._optional_str("aligned_depth_topic")
+        self.depth_scale_m = camera_config.get("depth_scale_m")
+        if self.enable_depth:
+            if not self.depth_raw_topic or not self.aligned_depth_topic:
+                raise ConfigurationError(
+                    "enable_depth requires depth_raw_topic and aligned_depth_topic"
+                )
+            try:
+                self.depth_scale_m = float(self.depth_scale_m)
+            except (TypeError, ValueError) as exc:
+                raise ConfigurationError(
+                    "enable_depth requires a verified depth_scale_m in metres per Z16 unit"
+                ) from exc
+            if not np.isfinite(self.depth_scale_m) or self.depth_scale_m <= 0:
+                raise ConfigurationError(
+                    "depth_scale_m must be a finite positive metres-per-Z16-unit value"
+                )
 
         self.max_snapshot_age_s = float(server_config.get("max_snapshot_age_s", 0.25))
         self.sync_queue_size = int(server_config.get("sync_queue_size", 10))
         self.sync_slop_s = float(server_config.get("sync_slop_s", 0.05))
         self.tf_timeout_s = float(server_config.get("tf_timeout_s", 0.2))
+        self.baseline_consistency_tolerance_m = float(
+            server_config.get("baseline_consistency_tolerance_m", 0.005)
+        )
         if (
             self.max_snapshot_age_s <= 0
             or self.sync_queue_size <= 0
             or self.sync_slop_s < 0
             or self.tf_timeout_s < 0
+            or self.baseline_consistency_tolerance_m < 0
         ):
             raise ConfigurationError("Invalid camera snapshot/synchronization configuration")
 
@@ -118,6 +148,10 @@ class CameraRosBridge:
             raise ConfigurationError(f"camera {self.role!r} requires {key}")
         return value
 
+    def _optional_str(self, key: str) -> str | None:
+        value = str(self.config.get(key, "")).strip()
+        return value or None
+
     def start(self) -> None:
         """Start long-lived image, CameraInfo and TF subscribers."""
         try:
@@ -133,6 +167,7 @@ class CameraRosBridge:
 
         self._rospy = rospy
         self._ensure_ros_node()
+        self._validate_driver_serial()
         self._cv_bridge = CvBridge()
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer)
@@ -142,6 +177,13 @@ class CameraRosBridge:
             message_filters.Subscriber(self.left_ir_topic, Image),
             message_filters.Subscriber(self.right_ir_topic, Image),
         ]
+        if self.enable_depth:
+            image_subscribers.extend(
+                [
+                    message_filters.Subscriber(self.depth_raw_topic, Image),
+                    message_filters.Subscriber(self.aligned_depth_topic, Image),
+                ]
+            )
         synchronizer = message_filters.ApproximateTimeSynchronizer(
             image_subscribers,
             queue_size=self.sync_queue_size,
@@ -160,6 +202,25 @@ class CameraRosBridge:
         ]
         self._subscriber_handles = image_subscribers + [synchronizer] + info_subscribers
 
+    def _validate_driver_serial(self) -> None:
+        """Reject a config/driver serial mismatch when the driver exposes it.
+
+        ``serial`` is the physical RealSense serial, never a role or namespace.
+        Some ROS driver versions do not expose the parameter immediately, so a
+        missing parameter is not fatal; a present mismatching value is.
+        """
+        get_param = getattr(self._rospy, "get_param", None)
+        has_param = getattr(self._rospy, "has_param", None)
+        parameter = f"{self.namespace.rstrip('/')}/serial_no"
+        if not callable(get_param) or (callable(has_param) and not has_param(parameter)):
+            return
+        driver_serial = str(get_param(parameter, "")).strip()
+        if driver_serial and driver_serial != self.serial:
+            raise ConfigurationError(
+                f"configured RealSense serial {self.serial!r} does not match "
+                f"ROS driver {parameter}={driver_serial!r}"
+            )
+
     def _ensure_ros_node(self) -> None:
         """Initialise the ROS node before registering camera subscribers."""
         if self._rospy is None:
@@ -173,8 +234,16 @@ class CameraRosBridge:
             raise RuntimeError("rospy does not provide init_node")
         init_node("cobot_magic_tiptop_camera_bridge", anonymous=True)
 
-    def _ros_image_callback(self, color: Any, left: Any, right: Any) -> None:
-        """Convert one synchronised RGB/IR1/IR2 ROS frame triplet."""
+    def _ros_image_callback(self, color: Any, left: Any, right: Any, *depth_messages: Any) -> None:
+        """Convert one synchronised RealSense snapshot without resizing streams."""
+        messages = (color, left, right) + tuple(depth_messages)
+        if self.enable_depth and len(depth_messages) != 2:
+            raise ValueError("Depth-enabled synchronizer must provide raw and aligned depth")
+        if not self.enable_depth and depth_messages:
+            raise ValueError("Depth messages received while enable_depth is false")
+        timestamps = tuple(self._stamp_seconds(message) for message in messages)
+        if max(timestamps) - min(timestamps) > self.sync_slop_s:
+            raise ValueError("Synchronized RealSense image stamps exceed the configured sync slop")
         rgb = self._as_rgb(self._cv_bridge.imgmsg_to_cv2(color, desired_encoding="rgb8"))
         ir_left = self._as_ir_gray(
             self._cv_bridge.imgmsg_to_cv2(left, desired_encoding="passthrough")
@@ -182,16 +251,49 @@ class CameraRosBridge:
         ir_right = self._as_ir_gray(
             self._cv_bridge.imgmsg_to_cv2(right, desired_encoding="passthrough")
         )
-        timestamps = (
-            self._stamp_seconds(color),
-            self._stamp_seconds(left),
-            self._stamp_seconds(right),
-        )
-        if max(timestamps) - min(timestamps) > self.sync_slop_s:
-            raise ValueError("RGB and IR image stamps exceed the configured sync slop")
+        kwargs: dict[str, Any] = {}
+        if self.enable_depth:
+            raw_message, aligned_message = depth_messages
+            kwargs["depth_raw"] = self._as_depth_raw(
+                self._cv_bridge.imgmsg_to_cv2(raw_message, desired_encoding="passthrough")
+            )
+            aligned = self._cv_bridge.imgmsg_to_cv2(
+                aligned_message, desired_encoding="passthrough"
+            )
+            kwargs["depth"] = self._as_aligned_depth(aligned, aligned_message)
         self.update_snapshot(
-            timestamp=timestamps[0], rgb=rgb, ir_left=ir_left, ir_right=ir_right
+            timestamp=timestamps[0], rgb=rgb, ir_left=ir_left, ir_right=ir_right, **kwargs
         )
+
+    @staticmethod
+    def _as_depth_raw(image: Any) -> np.ndarray:
+        result = np.asarray(image)
+        if result.dtype != np.uint16 or result.ndim != 2:
+            raise ValueError("depth_raw must be uint16 [H,W] Z16")
+        return np.ascontiguousarray(result)
+
+    def _as_aligned_depth(self, image: Any, message: Any) -> np.ndarray:
+        """Return aligned depth in metres only for an explicit ROS encoding."""
+        result = np.asarray(image)
+        encoding = str(getattr(message, "encoding", "")).upper()
+        if result.ndim != 2:
+            raise ValueError("aligned depth must be single-channel [H,W]")
+        if encoding in {"16UC1", "MONO16"}:
+            if result.dtype != np.uint16:
+                raise ValueError("16UC1 aligned depth must decode to uint16")
+            metres = result.astype(np.float32) * np.float32(self.depth_scale_m)
+        elif encoding == "32FC1":
+            if result.dtype not in (np.float32, np.float64):
+                raise ValueError("32FC1 aligned depth must decode to floating point metres")
+            metres = result.astype(np.float32, copy=False)
+        else:
+            raise ValueError(
+                "aligned depth encoding must be 16UC1 (using verified depth_scale_m) or 32FC1 metres"
+            )
+        metres = np.ascontiguousarray(metres, dtype=np.float32)
+        if not np.all(np.isfinite(metres)):
+            raise ValueError("depth must contain only finite values in metres")
+        return metres
 
     @staticmethod
     def _stamp_seconds(message: Any) -> float:
@@ -237,7 +339,10 @@ class CameraRosBridge:
         self._refresh_intrinsics_from_ros()
 
     def _right_ir_info_callback(self, info: Any) -> None:
-        right_ir_info = _RightIrInfo(baseline_ir=self._baseline_from_right_info(info))
+        right_ir_info = _RightIrInfo(
+            frame_id=self._frame_id(info, "right IR"),
+            baseline_from_projection_m=self._baseline_from_right_info(info),
+        )
         with self._intrinsics_lock:
             self._right_ir_info = right_ir_info
             self._latest_intrinsics = None
@@ -266,15 +371,20 @@ class CameraRosBridge:
         return frame_id
 
     @staticmethod
-    def _baseline_from_right_info(info: Any) -> float:
+    def _baseline_from_right_info(info: Any) -> float | None:
+        """Fallback baseline in metres from rectified IR2 projection matrix."""
         P = np.asarray(getattr(info, "P", ()), dtype=np.float64)
-        if P.shape != (12,) or not np.all(np.isfinite(P)):
-            raise ValueError("right IR CameraInfo.P must contain twelve finite values")
+        if P.shape != (12,):
+            raise ValueError("right IR CameraInfo.P must contain twelve values")
+        if not np.all(np.isfinite(P)):
+            raise ValueError("right IR CameraInfo.P must contain finite values")
         if P[0] == 0:
-            raise ValueError("right IR CameraInfo.P[0,0] must be non-zero")
+            return None
         baseline_ir = float(abs(P[3] / P[0]))
-        if not np.isfinite(baseline_ir) or baseline_ir <= 0:
-            raise ValueError("right IR CameraInfo.P must encode a positive baseline in metres")
+        if not np.isfinite(baseline_ir):
+            raise ValueError("right IR CameraInfo.P must encode a finite baseline")
+        if baseline_ir == 0:
+            return None
         return baseline_ir
 
     def _refresh_intrinsics_from_ros(self) -> None:
@@ -293,26 +403,78 @@ class CameraRosBridge:
         if self._tf_buffer is None or self._rospy is None:
             return
         try:
-            transform = self._tf_buffer.lookup_transform(
+            color_from_ir = self._tf_buffer.lookup_transform(
                 color_info.frame_id,
                 left_ir_info.frame_id,
                 self._rospy.Time(0),
                 self._rospy.Duration(self.tf_timeout_s),
             )
-            T_color_from_ir = self._transform_matrix(transform)
-            self.update_intrinsics(
-                K_color=color_info.K,
-                distortion_color=color_info.D,
-                K_ir=left_ir_info.K,
-                baseline_ir=right_ir_info.baseline_ir,
-                T_color_from_ir=T_color_from_ir,
-            )
+            T_color_from_ir = self._transform_matrix(color_from_ir)
         except Exception as exc:
             with self._intrinsics_lock:
                 self._intrinsics_error = (
                     "Waiting for TF transform "
                     f"{color_info.frame_id!r} <- {left_ir_info.frame_id!r}: {exc}"
                 )
+            return
+        baseline_projection = right_ir_info.baseline_from_projection_m
+        try:
+            baseline_tf = self._translation_norm(
+                self._tf_buffer.lookup_transform(
+                    left_ir_info.frame_id,
+                    right_ir_info.frame_id,
+                    self._rospy.Time(0),
+                    self._rospy.Duration(self.tf_timeout_s),
+                )
+            )
+            baseline_ir = baseline_tf
+        except Exception as tf_exc:
+            # TF is preferred, but drivers that do not publish the IR-to-IR
+            # static transform can still provide a valid rectified P matrix.
+            if baseline_projection is None:
+                with self._intrinsics_lock:
+                    self._intrinsics_error = (
+                        "Waiting for IR1/IR2 baseline TF (and CameraInfo.P fallback): "
+                        f"{tf_exc}"
+                    )
+                return
+            baseline_ir = baseline_projection
+        else:
+            if (
+                baseline_projection is not None
+                and abs(baseline_tf - baseline_projection)
+                > self.baseline_consistency_tolerance_m
+            ):
+                with self._intrinsics_lock:
+                    self._intrinsics_error = (
+                        "IR baseline TF and CameraInfo.P disagree: "
+                        f"{baseline_tf:.6f} m vs {baseline_projection:.6f} m"
+                    )
+                return
+        self.update_intrinsics(
+            K_color=color_info.K,
+            distortion_color=color_info.D,
+            K_ir=left_ir_info.K,
+            baseline_ir=baseline_ir,
+            T_color_from_ir=T_color_from_ir,
+        )
+
+    @staticmethod
+    def _translation_norm(transform_stamped: Any) -> float:
+        transform = getattr(transform_stamped, "transform", transform_stamped)
+        translation = getattr(transform, "translation", None)
+        vector = np.asarray(
+            [
+                getattr(translation, "x", np.nan),
+                getattr(translation, "y", np.nan),
+                getattr(translation, "z", np.nan),
+            ],
+            dtype=np.float64,
+        )
+        baseline = float(np.linalg.norm(vector))
+        if not np.isfinite(baseline) or baseline <= 0:
+            raise ValueError("IR baseline TF translation must be finite and positive metres")
+        return baseline
 
     @staticmethod
     def _transform_matrix(transform_stamped: Any) -> np.ndarray:
@@ -401,6 +563,8 @@ class CameraRosBridge:
         rgb: np.ndarray,
         ir_left: np.ndarray,
         ir_right: np.ndarray,
+        depth: np.ndarray | None = None,
+        depth_raw: np.ndarray | None = None,
     ) -> None:
         """Store one validated RGB/IR triplet; used directly by unit tests."""
         timestamp = float(timestamp)
@@ -411,12 +575,30 @@ class CameraRosBridge:
         ir_right = self._as_ir_gray(ir_right)
         if rgb.shape[:2] != ir_left.shape or ir_left.shape != ir_right.shape:
             raise ValueError("RGB, left IR and right IR resolutions must match exactly")
+        if (depth is None) != (depth_raw is None):
+            raise ValueError("depth and depth_raw must either both be present or both be absent")
+        if self.enable_depth and (depth is None or depth_raw is None):
+            raise ValueError("enable_depth requires depth and depth_raw in every snapshot")
+        if depth is not None and depth_raw is not None:
+            depth = np.asarray(depth)
+            if depth.dtype != np.float32:
+                raise ValueError("depth must be float32 [H,W] in metres")
+            depth = np.ascontiguousarray(depth)
+            depth_raw = self._as_depth_raw(depth_raw)
+            if depth.ndim != 2 or depth.shape != rgb.shape[:2]:
+                raise ValueError("depth must be float32 [H,W] aligned to RGB")
+            if depth_raw.shape != rgb.shape[:2]:
+                raise ValueError("depth_raw must be uint16 [H,W] synchronized with RGB")
+            if not np.all(np.isfinite(depth)):
+                raise ValueError("depth must contain only finite metre values")
         snapshot = RemoteCameraSnapshot(
             serial=self.serial,
             timestamp=timestamp,
             rgb=rgb.copy(),
             ir_left=ir_left.copy(),
             ir_right=ir_right.copy(),
+            depth=None if depth is None else depth.copy(),
+            depth_raw=None if depth_raw is None else depth_raw.copy(),
         )
         with self._snapshot_lock:
             self._latest_snapshot = snapshot
@@ -467,6 +649,7 @@ class CameraRosBridge:
             "calibration_ready": intrinsics is not None,
             "calibration_error": intrinsics_error,
             "has_ir": True,
+            "enable_depth": self.enable_depth,
         }
 
     def close(self) -> None:

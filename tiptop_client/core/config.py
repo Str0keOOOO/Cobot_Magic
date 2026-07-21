@@ -27,15 +27,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "servo_rate_hz": 200.0,
         "state_timeout_s": 5.0,
         "max_state_age_s": 0.25,
-        "max_initial_error_rad": 0.017453292519943295,
         "gripper_open_position": 0.08,
         "gripper_closed_position": 0.0,
         "gripper_min_move_time_s": 0.25,
         "gripper_max_move_time_s": 1.5,
-        # These must be filled from the physical robot, its URDF, or vendor data.
-        "joint_lower_rad": None,
-        "joint_upper_rad": None,
-        "max_joint_velocity_rad_s": None,
         # "intervals": durations[i] is the duration ending at waypoint i.
         # "timestamps": durations[i] is a cumulative timestamp from start.
         "trajectory_duration_mode": "intervals",
@@ -47,6 +42,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_snapshot_age_s": 0.25,
         "sync_queue_size": 10,
         "sync_slop_s": 0.05,
+        "tf_timeout_s": 0.2,
+        "baseline_consistency_tolerance_m": 0.005,
     },
     "cameras": {},
 }

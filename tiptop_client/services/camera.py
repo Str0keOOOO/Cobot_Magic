@@ -171,13 +171,17 @@ class CobotMagicCameraServer:
 
     @staticmethod
     def _snapshot_result(snapshot: RemoteCameraSnapshot) -> dict[str, Any]:
-        return {
+        result = {
             "serial": snapshot.serial,
             "timestamp": snapshot.timestamp,
             "rgb": snapshot.rgb,
             "ir_left": snapshot.ir_left,
             "ir_right": snapshot.ir_right,
         }
+        if snapshot.depth is not None and snapshot.depth_raw is not None:
+            result["depth"] = snapshot.depth
+            result["depth_raw"] = snapshot.depth_raw
+        return result
 
     def close(self) -> None:
         self._stopped = True

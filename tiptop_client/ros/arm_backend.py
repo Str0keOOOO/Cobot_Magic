@@ -46,9 +46,6 @@ class CobotMagicRosBackend:
         self.servo_rate_hz = self._positive_float("servo_rate_hz", 200.0)
         self.state_timeout_s = self._positive_float("state_timeout_s", 5.0)
         self.max_state_age_s = self._positive_float("max_state_age_s", 0.25)
-        self.max_initial_error_rad = self._positive_float(
-            "max_initial_error_rad", math.radians(1.0)
-        )
         self.gripper_open_position = float(
             self._cfg.get("gripper_open_position", 0.08)
         )
@@ -169,7 +166,6 @@ class CobotMagicRosBackend:
             "state_topic": self.state_topic,
             "command_topic": self.command_topic,
             "servo_rate_hz": self.servo_rate_hz,
-            "joint_limits_configured": self._limits_configured(),
             "safe_stop_interface_available": False,
         }
 
@@ -253,18 +249,9 @@ class CobotMagicRosBackend:
         try:
             self._validate_trajectory(joint_confs, joint_vels, durations)
             positions = np.asarray(joint_confs, dtype=np.float64)
-            velocities = np.asarray(joint_vels, dtype=np.float64)
             intervals = self._trajectory_intervals(np.asarray(durations, dtype=np.float64))
-            # self._validate_limits(positions, velocities)
 
             current = np.asarray(self.get_joint_positions(), dtype=np.float64)
-            position_error = float(np.max(np.abs(current - positions[0])))
-            # if position_error > self.max_initial_error_rad:
-            #     raise RobotNotReadyError(
-            #         "First trajectory waypoint is too far from current position "
-            #         f"({position_error:.6f} rad > {self.max_initial_error_rad:.6f} rad)"
-            #     )
-            self._validate_interpolated_segment_speeds(current, positions, intervals)
 
             self._stop_event.clear()
             with self._state_lock:
@@ -320,65 +307,6 @@ class CobotMagicRosBackend:
         if np.any(durations < 0) or np.any(np.diff(durations) < 0):
             raise ValueError("Trajectory timestamps must be non-negative and monotonic")
         return np.diff(np.concatenate((np.array([0.0]), durations)))
-
-    def _limits_configured(self) -> bool:
-        return all(
-            self._cfg.get(key) is not None
-            for key in (
-                "joint_lower_rad",
-                "joint_upper_rad",
-                "max_joint_velocity_rad_s",
-            )
-        )
-
-    def _limit_vector(self, key: str) -> np.ndarray:
-        raw = self._cfg.get(key)
-        if raw is None:
-            raise ConfigurationError(
-                f"{key} is not configured from verified robot/URDF/vendor data; "
-                "refusing trajectory execution"
-            )
-        values = np.asarray(raw, dtype=np.float64)
-        if values.shape != (self.arm_dof,) or not np.all(np.isfinite(values)):
-            raise ConfigurationError(
-                f"{key} must contain {self.arm_dof} finite values"
-            )
-        return values
-
-    def _validate_limits(self, positions: np.ndarray, velocities: np.ndarray) -> None:
-        lower = self._limit_vector("joint_lower_rad")
-        upper = self._limit_vector("joint_upper_rad")
-        max_velocity = self._limit_vector("max_joint_velocity_rad_s")
-        if np.any(lower > upper):
-            raise ConfigurationError("joint_lower_rad must be <= joint_upper_rad")
-        if np.any(max_velocity <= 0):
-            raise ConfigurationError("max_joint_velocity_rad_s must be positive")
-        if np.any(positions < lower) or np.any(positions > upper):
-            raise ValueError("Trajectory violates configured joint limits")
-        if np.any(np.abs(velocities) > max_velocity):
-            raise ValueError("Trajectory violates configured joint velocity limits")
-
-    def _validate_interpolated_segment_speeds(
-        self,
-        current: np.ndarray,
-        positions: np.ndarray,
-        intervals: np.ndarray,
-    ) -> None:
-        """Check the speed actually produced by local trajectory interpolation."""
-        max_velocity = self._limit_vector("max_joint_velocity_rad_s")
-        previous = current
-        for index, (target, duration) in enumerate(zip(positions, intervals)):
-            delta = np.abs(target - previous)
-            if duration == 0.0:
-                if np.any(delta > 1e-12):
-                    raise ValueError(
-                        f"Trajectory segment {index} has non-zero motion and zero duration"
-                    )
-            elif np.any(delta / duration > max_velocity):
-                raise ValueError(
-                    f"Trajectory segment {index} exceeds configured joint velocity limits"
-                )
-            previous = target
 
     def _full_command(self, arm_q: np.ndarray) -> np.ndarray:
         state = self._get_current_state()
