@@ -32,7 +32,7 @@ roslaunch piper start_ms_piper.launch mode:=1 auto_enable:=true
 ### 3. 终端三：启动三台 Intel RealSense 相机
 
 ```bash
-cd /home/agilex/xuchenfei/Cobot_Magic/Piper_ros_private-ros-noetic
+cd /home/agilex/xuchenfei/Cobot_Magic/camera_ws
 source devel/setup.bash
 roslaunch realsense2_camera multi_camera.launch
 ```

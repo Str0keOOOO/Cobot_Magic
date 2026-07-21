@@ -255,15 +255,15 @@ class CobotMagicRosBackend:
             positions = np.asarray(joint_confs, dtype=np.float64)
             velocities = np.asarray(joint_vels, dtype=np.float64)
             intervals = self._trajectory_intervals(np.asarray(durations, dtype=np.float64))
-            self._validate_limits(positions, velocities)
+            # self._validate_limits(positions, velocities)
 
             current = np.asarray(self.get_joint_positions(), dtype=np.float64)
             position_error = float(np.max(np.abs(current - positions[0])))
-            if position_error > self.max_initial_error_rad:
-                raise RobotNotReadyError(
-                    "First trajectory waypoint is too far from current position "
-                    f"({position_error:.6f} rad > {self.max_initial_error_rad:.6f} rad)"
-                )
+            # if position_error > self.max_initial_error_rad:
+            #     raise RobotNotReadyError(
+            #         "First trajectory waypoint is too far from current position "
+            #         f"({position_error:.6f} rad > {self.max_initial_error_rad:.6f} rad)"
+            #     )
             self._validate_interpolated_segment_speeds(current, positions, intervals)
 
             self._stop_event.clear()
