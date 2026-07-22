@@ -84,13 +84,13 @@ python3 -m tiptop_client camera-server --config tiptop_client/config.yaml
 | `health` | 无 | 每台已配置相机的运行状态。 |
 | `list_cameras` | 无 | 已配置相机的 `namespace`、`serial` 和 `role`。 |
 | `get_intrinsics` | 必填 `serial` | 只返回静态标定：`serial`、`K_color: float32[3,3]`、`K_ir: float32[3,3]`、`baseline_ir`（米）、`T_color_from_ir: float32[4,4]`、`distortion_color: float32[5]`。CameraInfo 和 TF 独立缓存，因此不等待图像。`T_color_from_ir` 是 `color optical frame ← IR1 optical frame`，满足 `point_color = T_color_from_ir @ point_ir`。baseline 优先为 IR1←IR2 TF 平移范数，IR2 `P[0,3]/P[0,0]` 仅作可校验的回退。 |
-| `read_camera` | 必填 `serial` | 只返回最新同步动态帧：`serial`、color header 的有限 `timestamp`、RGB `uint8[H,W,3]`（RGB 顺序）、`ir_left: uint8[H,W]`、`ir_right: uint8[H,W]`。三张图必须同分辨率，IR 不复制为三通道。仅当 `enable_depth: true` 时还返回对齐 RGB 的米制 `depth: float32[H,W]` 和未对齐 Z16 `depth_raw: uint16[H,W]`。 |
+| `read_camera` | 必填 `serial`；可选 `enable_depth`（布尔，默认 `false`） | 只返回最新同步动态帧：`serial`、color header 的有限 `timestamp`、RGB `uint8[H,W,3]`（RGB 顺序）、`ir1: uint8[H,W]`（左 IR）、`ir2: uint8[H,W]`（右 IR）。三张图必须同分辨率，IR 不复制为三通道。仅当 `enable_depth: true` 时还返回对齐 RGB 的米制 `depth: float32[H,W]`；`enable_depth: false` 时不返回 `depth`。若请求了深度但该相机未在配置中启用深度流，返回错误 `DEPTH_UNAVAILABLE`。 |
 
 ```python
 get_intrinsics = {"serial": "339222070351", "K_color": Kc, "K_ir": Ki,
                   "baseline_ir": 0.055, "T_color_from_ir": Tci,
                   "distortion_color": Dc}
 read_camera = {"serial": "339222070351", "timestamp": 1710000000.0,
-               "rgb": rgb, "ir_left": ir1, "ir_right": ir2}
-# enable_depth=true 时 read_camera 另有 depth 和 depth_raw。
+               "rgb": rgb, "ir1": ir_left, "ir2": ir_right}
+# enable_depth=true 时 read_camera 另有 depth（float32 米制、与 RGB 对齐）。
 ```

@@ -6,7 +6,7 @@ from typing import Any
 
 import zmq
 
-from ..core.errors import BridgeError, CameraNotReadyError
+from ..core.errors import BridgeError, CameraNotReadyError, DepthUnavailableError
 from ..ros.camera_bridge import (
     CameraRosBridge,
     RemoteCameraIntrinsics,
@@ -134,7 +134,7 @@ class CobotMagicCameraServer:
                 ]
             }
         if op in {"get_intrinsics", "read_camera"}:
-            self._require_only(params, {"serial"})
+            self._require_only(params, {"serial", "enable_depth"} if op == "read_camera" else {"serial"})
             serial = params.get("serial")
             if not isinstance(serial, str) or not serial:
                 raise ValueError("serial must be a non-empty string")
@@ -143,7 +143,14 @@ class CobotMagicCameraServer:
                 # Calibration is cached from CameraInfo/TF and intentionally
                 # does not wait for a synchronized image triplet.
                 return self._intrinsics_result(camera.read_intrinsics())
-            return self._snapshot_result(camera.read_snapshot())
+            enable_depth = params.get("enable_depth", False)
+            if not isinstance(enable_depth, bool):
+                raise ValueError("enable_depth must be a boolean")
+            if enable_depth and not camera.enable_depth:
+                raise DepthUnavailableError(
+                    f"Depth was requested, but camera {serial!r} has no active depth stream"
+                )
+            return self._snapshot_result(camera.read_snapshot(), enable_depth=enable_depth)
         raise AssertionError(op)
 
     @staticmethod
@@ -170,17 +177,19 @@ class CobotMagicCameraServer:
         }
 
     @staticmethod
-    def _snapshot_result(snapshot: RemoteCameraSnapshot) -> dict[str, Any]:
+    def _snapshot_result(
+        snapshot: RemoteCameraSnapshot, *, enable_depth: bool
+    ) -> dict[str, Any]:
+        # TiPToP's remote client reads ir1/ir2; ir_left/ir_right stay internal.
         result = {
             "serial": snapshot.serial,
             "timestamp": snapshot.timestamp,
             "rgb": snapshot.rgb,
-            "ir_left": snapshot.ir_left,
-            "ir_right": snapshot.ir_right,
+            "ir1": snapshot.ir_left,
+            "ir2": snapshot.ir_right,
         }
-        if snapshot.depth is not None and snapshot.depth_raw is not None:
+        if enable_depth:
             result["depth"] = snapshot.depth
-            result["depth_raw"] = snapshot.depth_raw
         return result
 
     def close(self) -> None:

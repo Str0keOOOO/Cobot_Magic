@@ -34,5 +34,9 @@ class CameraNotReadyError(BridgeError):
     retryable = True
 
 
+class DepthUnavailableError(BridgeError):
+    code = "DEPTH_UNAVAILABLE"
+
+
 class ConfigurationError(BridgeError):
     code = "CONFIGURATION_ERROR"
